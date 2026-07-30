@@ -1,9 +1,14 @@
 apiVersion: platform.platform.io/v1alpha1
 kind: Tenant
 metadata:
-  labels:
-    app.kubernetes.io/name: custom-tenant-operator
-    app.kubernetes.io/managed-by: kustomize
-  name: tenant-sample
+  name: team-payments
 spec:
-  # TODO(user): Add fields here
+  displayName: "Payments Team"
+  users:
+    - name: alice
+      role: admin
+    - name: bob
+      role: view
+  quota:
+    cpu: "4"
+    memory: "8Gi"
