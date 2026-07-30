@@ -8,4 +8,14 @@ layout:
 - go.kubebuilder.io/v4
 projectName: custom-tenant-operator
 repo: github.com/dakshina13/custom-tenant-operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: platform.io
+  group: platform
+  kind: Tenant
+  path: github.com/dakshina13/custom-tenant-operator/api/v1alpha1
+  version: v1alpha1
 version: "3"

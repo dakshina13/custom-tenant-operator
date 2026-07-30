@@ -34,3 +34,14 @@ echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
 source ~/.bashrc
 go version
 ```
+## Kubebuilder imit
+```bash
+kubebuilder init --domain platform.io --repo github.com/dakshina13/custom-tenant-operator
+```
+**Description:** Scaffolds a new Kubebuilder operator project and configures base settings.
+
+- **Project:** Creates `PROJECT` and standard scaffold files (Makefile, `cmd/`, `config/`)
+- **Domain:** Sets API domain to `platform.io` for CRD API group names
+- **Module:** Sets Go module root to `github.com/dakshina13/custom-tenant-operator`
+- **Boilerplate:** Initializes `go.mod` and writes controller-runtime main/manager wiring
+- **Next steps:** Prepares the workspace for `kubebuilder create api` and `kubebuilder create webhook`
