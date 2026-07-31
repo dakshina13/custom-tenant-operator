@@ -19,9 +19,13 @@ package controller
 import (
 	"context"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	platformv1alpha1 "github.com/dakshina13/custom-tenant-operator/api/v1alpha1"
@@ -36,6 +40,7 @@ type TenantReconciler struct {
 // +kubebuilder:rbac:groups=platform.platform.io,resources=tenants,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=platform.platform.io,resources=tenants/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=platform.platform.io,resources=tenants/finalizers,verbs=update
+// +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -47,9 +52,44 @@ type TenantReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/reconcile
 func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	logger := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	var tenant platformv1alpha1.Tenant
+	if err := r.Get(ctx, req.NamespacedName, &tenant); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Tenant was deleted — nothing to do (no finalizer logic yet, that's Phase 4)
+			logger.Info("Tenant not found, likely deleted", "name", req.Name)
+			return ctrl.Result{}, nil
+		}
+		// Some other error (e.g. API server hiccup) — requeue
+		logger.Error(err, "unable to fetch Tenant")
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("reconciling Tenant", "name", tenant.Name, "displayName", tenant.Spec.DisplayName)
+	// Define the namespace we want to exist for this tenant
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tenant.Name,
+		},
+	}
+
+	// CreateOrUpdate: fetches the object if it exists, applies the mutation, and
+	// creates or patches as needed — this is what makes reconcile idempotent
+	// instead of blindly calling Create() every time (which would error on the 2nd run).
+	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, ns, func() error {
+		// SetControllerReference makes the Tenant the owner of this Namespace.
+		// This gives us garbage-collection for free: deleting the Tenant will
+		// cascade-delete the Namespace via Kubernetes' built-in owner-reference GC,
+		// even before we add explicit finalizer logic in Phase 4.
+		return controllerutil.SetControllerReference(&tenant, ns, r.Scheme)
+	})
+	if err != nil {
+		logger.Error(err, "unable to reconcile Namespace", "namespace", tenant.Name)
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("reconciled Namespace", "namespace", ns.Name, "operation", result)
 
 	return ctrl.Result{}, nil
 }
