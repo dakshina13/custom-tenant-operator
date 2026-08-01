@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -41,6 +42,8 @@ type TenantReconciler struct {
 // +kubebuilder:rbac:groups=platform.platform.io,resources=tenants/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=platform.platform.io,resources=tenants/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -67,6 +70,8 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	logger.Info("reconciling Tenant", "name", tenant.Name, "displayName", tenant.Spec.DisplayName)
+
+	// --- Namespace ---
 	// Define the namespace we want to exist for this tenant
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -90,6 +95,51 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	logger.Info("reconciled Namespace", "namespace", ns.Name, "operation", result)
+
+	// --- ResourceQuota ---
+	// Only create a ResourceQuota if the tenant actually specified quota values.
+	// An empty spec.quota (both fields blank) means "no quota enforced" — skip it
+	// rather than creating a ResourceQuota with empty limits (which would behave
+	// oddly / be misleading in kubectl describe).
+	if tenant.Spec.Quota.CPU != "" || tenant.Spec.Quota.Memory != "" {
+		quota := &corev1.ResourceQuota{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "tenant-quota",
+				Namespace: tenant.Name,
+			},
+		}
+
+		quotaResult, err := controllerutil.CreateOrUpdate(ctx, r.Client, quota, func() error {
+			hard := corev1.ResourceList{}
+			if tenant.Spec.Quota.CPU != "" {
+				cpuQty, parseErr := resource.ParseQuantity(tenant.Spec.Quota.CPU)
+				if parseErr != nil {
+					return parseErr
+				}
+				hard[corev1.ResourceRequestsCPU] = cpuQty
+				hard[corev1.ResourceLimitsCPU] = cpuQty
+			}
+			if tenant.Spec.Quota.Memory != "" {
+				memQty, parseErr := resource.ParseQuantity(tenant.Spec.Quota.Memory)
+				if parseErr != nil {
+					return parseErr
+				}
+				hard[corev1.ResourceRequestsMemory] = memQty
+				hard[corev1.ResourceLimitsMemory] = memQty
+			}
+			quota.Spec.Hard = hard
+
+			// ResourceQuota is namespace-scoped, Tenant is cluster-scoped —
+			// this combination IS allowed (cluster-scoped owners can own
+			// namespace-scoped dependents in any namespace).
+			return controllerutil.SetControllerReference(&tenant, quota, r.Scheme)
+		})
+		if err != nil {
+			logger.Error(err, "unable to reconcile ResourceQuota", "namespace", tenant.Name)
+			return ctrl.Result{}, err
+		}
+		logger.Info("reconciled ResourceQuota", "namespace", tenant.Name, "operation", quotaResult)
+	}
 
 	return ctrl.Result{}, nil
 }
