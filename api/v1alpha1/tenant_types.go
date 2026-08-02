@@ -87,6 +87,8 @@ type TenantStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:printcolumn:name="DisplayName",type=string,JSONPath=`.spec.displayName`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`
 // Tenant is the Schema for the tenants API
 type Tenant struct {
 	metav1.TypeMeta `json:",inline"`

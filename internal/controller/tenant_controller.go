@@ -22,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,6 +40,23 @@ const tenantFinalizer = "platform.platform.io/tenant-finalizer"
 type TenantReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+}
+
+func (r *TenantReconciler) setCondition(ctx context.Context, tenant *platformv1alpha1.Tenant, condType string, status metav1.ConditionStatus, reason, message string) error {
+	changed := meta.SetStatusCondition(&tenant.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: tenant.Generation,
+	})
+	if !changed {
+		// Nothing actually changed — skip the write entirely.
+		// This is what breaks the self-triggering loop: no write, no new
+		// resourceVersion, no new watch event, no new reconcile.
+		return nil
+	}
+	return r.Status().Update(ctx, tenant)
 }
 
 // +kubebuilder:rbac:groups=platform.platform.io,resources=tenants,verbs=get;list;watch;create;update;patch;delete
@@ -123,6 +141,18 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	logger.Info("reconciling Tenant", "name", tenant.Name, "displayName", tenant.Spec.DisplayName)
 
+	// Removed the unconditional "Provisioning" write here — it was flipping
+	// Ready False→True on literally every single reconcile, which is itself
+	// a real change each time, guaranteeing a write and a fresh watch event
+	// forever. The final "Ready=True" call at the bottom already handles the
+	// steady-state case correctly (no-op once already True).
+	if !meta.IsStatusConditionTrue(tenant.Status.Conditions, "Ready") {
+		if err := r.setCondition(ctx, &tenant, "Ready", metav1.ConditionFalse, "Provisioning", "Reconciling tenant resources"); err != nil {
+			logger.Error(err, "unable to set Provisioning condition")
+			return ctrl.Result{}, err
+		}
+	}
+
 	// --- Namespace ---
 	// Define the namespace we want to exist for this tenant
 	ns := &corev1.Namespace{
@@ -143,6 +173,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	})
 	if err != nil {
 		logger.Error(err, "unable to reconcile Namespace", "namespace", tenant.Name)
+		_ = r.setCondition(ctx, &tenant, "Ready", metav1.ConditionFalse, "Failed", "Failed to reconcile Namespace: "+err.Error())
 		return ctrl.Result{}, err
 	}
 
@@ -188,6 +219,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		})
 		if err != nil {
 			logger.Error(err, "unable to reconcile ResourceQuota", "namespace", tenant.Name)
+			_ = r.setCondition(ctx, &tenant, "Ready", metav1.ConditionFalse, "Failed", "Failed to reconcile ResourceQuota: "+err.Error())
 			return ctrl.Result{}, err
 		}
 		logger.Info("reconciled ResourceQuota", "namespace", tenant.Name, "operation", quotaResult)
@@ -230,6 +262,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		})
 		if err != nil {
 			logger.Error(err, "unable to reconcile RoleBinding", "user", user.Name, "role", user.Role)
+			_ = r.setCondition(ctx, &tenant, "Ready", metav1.ConditionFalse, "Failed", "Failed to reconcile RoleBinding: "+err.Error())
 			return ctrl.Result{}, err
 		}
 		logger.Info("reconciled RoleBinding", "namespace", tenant.Name, "user", user.Name, "role", user.Role, "operation", rbResult)
@@ -254,6 +287,11 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			}
 			logger.Info("pruned stale RoleBinding", "namespace", tenant.Name, "name", existing.Name)
 		}
+	}
+
+	if err := r.setCondition(ctx, &tenant, "Ready", metav1.ConditionTrue, "Provisioned", "All tenant resources reconciled successfully"); err != nil {
+		logger.Error(err, "unable to set Ready condition")
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
