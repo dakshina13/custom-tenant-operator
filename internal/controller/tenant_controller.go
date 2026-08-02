@@ -33,6 +33,8 @@ import (
 	platformv1alpha1 "github.com/dakshina13/custom-tenant-operator/api/v1alpha1"
 )
 
+const tenantFinalizer = "platform.platform.io/tenant-finalizer"
+
 // TenantReconciler reconciles a Tenant object
 type TenantReconciler struct {
 	client.Client
@@ -68,6 +70,55 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// Some other error (e.g. API server hiccup) — requeue
 		logger.Error(err, "unable to fetch Tenant")
 		return ctrl.Result{}, err
+	}
+
+	// --- Handle deletion ---
+	if !tenant.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&tenant, tenantFinalizer) {
+			logger.Info("Tenant is being deleted, running cleanup", "name", tenant.Name)
+
+			// Explicit, observable cleanup. Owner-reference GC would handle
+			// the Namespace (and everything inside it) automatically anyway,
+			// but doing it explicitly here means we control ordering, can log
+			// each step, and have a hook for any future cleanup that owner
+			// references can't reach (e.g. something outside the cluster).
+			ns := &corev1.Namespace{}
+			err := r.Get(ctx, client.ObjectKey{Name: tenant.Name}, ns)
+			if err == nil {
+				logger.Info("deleting Namespace as part of Tenant cleanup", "namespace", tenant.Name)
+				if delErr := r.Delete(ctx, ns); delErr != nil && !apierrors.IsNotFound(delErr) {
+					logger.Error(delErr, "failed to delete Namespace during cleanup", "namespace", tenant.Name)
+					return ctrl.Result{}, delErr
+				}
+			} else if !apierrors.IsNotFound(err) {
+				logger.Error(err, "unable to fetch Namespace during cleanup", "namespace", tenant.Name)
+				return ctrl.Result{}, err
+			}
+
+			logger.Info("cleanup complete, removing finalizer", "name", tenant.Name)
+			controllerutil.RemoveFinalizer(&tenant, tenantFinalizer)
+			if err := r.Update(ctx, &tenant); err != nil {
+				logger.Error(err, "unable to remove finalizer")
+				return ctrl.Result{}, err
+			}
+		}
+		// Finalizer removed (or was never present) — nothing more to do.
+		// Kubernetes will now actually delete the Tenant object.
+		return ctrl.Result{}, nil
+	}
+
+	// --- Ensure finalizer is present before doing any provisioning ---
+	if !controllerutil.ContainsFinalizer(&tenant, tenantFinalizer) {
+		logger.Info("adding finalizer", "name", tenant.Name)
+		controllerutil.AddFinalizer(&tenant, tenantFinalizer)
+		if err := r.Update(ctx, &tenant); err != nil {
+			logger.Error(err, "unable to add finalizer")
+			return ctrl.Result{}, err
+		}
+		// Adding the finalizer triggers another reconcile (the Update above
+		// causes a watch event), so we can safely return here and let that
+		// next pass continue with provisioning.
+		return ctrl.Result{}, nil
 	}
 
 	logger.Info("reconciling Tenant", "name", tenant.Name, "displayName", tenant.Spec.DisplayName)
