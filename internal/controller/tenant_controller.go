@@ -143,7 +143,10 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// --- RBAC: one RoleBinding per user ---
+	desired := make(map[string]bool) // tracks which RoleBinding names *should* exist
 	for _, user := range tenant.Spec.Users {
+		rbName := "tenant-" + user.Name + "-" + user.Role
+		desired[rbName] = true
 		rb := &rbacv1.RoleBinding{
 			ObjectMeta: metav1.ObjectMeta{
 				// Deterministic name so re-reconciling finds the same object
@@ -154,6 +157,9 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 
 		rbResult, err := controllerutil.CreateOrUpdate(ctx, r.Client, rb, func() error {
+			rb.Labels = map[string]string{
+				"platform.platform.io/tenant": tenant.Name,
+			}
 			rb.RoleRef = rbacv1.RoleRef{
 				APIGroup: rbacv1.GroupName,
 				Kind:     "ClusterRole",
@@ -176,6 +182,27 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			return ctrl.Result{}, err
 		}
 		logger.Info("reconciled RoleBinding", "namespace", tenant.Name, "user", user.Name, "role", user.Role, "operation", rbResult)
+	}
+
+	// --- Prune: delete any RoleBindings owned by this Tenant that are no
+	// longer represented in spec.users ---
+	var existingRBs rbacv1.RoleBindingList
+	if err := r.List(ctx, &existingRBs,
+		client.InNamespace(tenant.Name),
+		client.MatchingLabels{"platform.platform.io/tenant": tenant.Name},
+	); err != nil {
+		logger.Error(err, "unable to list RoleBindings for pruning", "namespace", tenant.Name)
+		return ctrl.Result{}, err
+	}
+
+	for _, existing := range existingRBs.Items {
+		if !desired[existing.Name] {
+			if err := r.Delete(ctx, &existing); err != nil && !apierrors.IsNotFound(err) {
+				logger.Error(err, "unable to prune stale RoleBinding", "name", existing.Name)
+				return ctrl.Result{}, err
+			}
+			logger.Info("pruned stale RoleBinding", "namespace", tenant.Name, "name", existing.Name)
+		}
 	}
 
 	return ctrl.Result{}, nil
