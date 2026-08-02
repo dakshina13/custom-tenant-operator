@@ -20,6 +20,7 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -139,6 +140,42 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			return ctrl.Result{}, err
 		}
 		logger.Info("reconciled ResourceQuota", "namespace", tenant.Name, "operation", quotaResult)
+	}
+
+	// --- RBAC: one RoleBinding per user ---
+	for _, user := range tenant.Spec.Users {
+		rb := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				// Deterministic name so re-reconciling finds the same object
+				// instead of creating duplicates on every loop.
+				Name:      "tenant-" + user.Name + "-" + user.Role,
+				Namespace: tenant.Name,
+			},
+		}
+
+		rbResult, err := controllerutil.CreateOrUpdate(ctx, r.Client, rb, func() error {
+			rb.RoleRef = rbacv1.RoleRef{
+				APIGroup: rbacv1.GroupName,
+				Kind:     "ClusterRole",
+				// This works because your enum values (admin, edit, view)
+				// are literally the names of Kubernetes' built-in ClusterRoles —
+				// no translation layer needed.
+				Name: user.Role,
+			}
+			rb.Subjects = []rbacv1.Subject{
+				{
+					Kind:     rbacv1.UserKind,
+					APIGroup: rbacv1.GroupName,
+					Name:     user.Name,
+				},
+			}
+			return controllerutil.SetControllerReference(&tenant, rb, r.Scheme)
+		})
+		if err != nil {
+			logger.Error(err, "unable to reconcile RoleBinding", "user", user.Name, "role", user.Role)
+			return ctrl.Result{}, err
+		}
+		logger.Info("reconciled RoleBinding", "namespace", tenant.Name, "user", user.Name, "role", user.Role, "operation", rbResult)
 	}
 
 	return ctrl.Result{}, nil
