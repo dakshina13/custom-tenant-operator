@@ -20,12 +20,14 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -35,6 +37,12 @@ import (
 )
 
 const tenantFinalizer = "platform.platform.io/tenant-finalizer"
+
+func ptrProtocol(p corev1.Protocol) *corev1.Protocol { return &p }
+func ptrIntOrString(port int32) *intstr.IntOrString {
+	v := intstr.FromInt32(port)
+	return &v
+}
 
 // TenantReconciler reconciles a Tenant object
 type TenantReconciler struct {
@@ -65,6 +73,8 @@ func (r *TenantReconciler) setCondition(ctx context.Context, tenant *platformv1a
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=bind,resourceNames=admin;edit;view
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -224,6 +234,64 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		logger.Info("reconciled ResourceQuota", "namespace", tenant.Name, "operation", quotaResult)
 	}
+
+	// --- NetworkPolicy: isolate tenant namespace traffic ---
+	np := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "tenant-isolation",
+			Namespace: tenant.Name,
+		},
+	}
+
+	npResult, err := controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+		np.Spec = networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{}, // applies to all pods in this namespace
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					// Allow traffic only from pods within the same namespace
+					From: []networkingv1.NetworkPolicyPeer{
+						{PodSelector: &metav1.LabelSelector{}},
+					},
+				},
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					// Allow egress within the same namespace
+					To: []networkingv1.NetworkPolicyPeer{
+						{PodSelector: &metav1.LabelSelector{}},
+					},
+				},
+				{
+					// Allow DNS resolution (UDP/TCP 53) — without this, pods
+					// can't resolve any hostnames at all, breaking almost
+					// everything.
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &metav1.LabelSelector{},
+							PodSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{"k8s-app": "kube-dns"},
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: ptrProtocol(corev1.ProtocolUDP), Port: ptrIntOrString(53)},
+						{Protocol: ptrProtocol(corev1.ProtocolTCP), Port: ptrIntOrString(53)},
+					},
+				},
+			},
+		}
+		return controllerutil.SetControllerReference(&tenant, np, r.Scheme)
+	})
+	if err != nil {
+		logger.Error(err, "unable to reconcile NetworkPolicy", "namespace", tenant.Name)
+		_ = r.setCondition(ctx, &tenant, "Ready", metav1.ConditionFalse, "Failed", "Failed to reconcile NetworkPolicy: "+err.Error())
+		return ctrl.Result{}, err
+	}
+	logger.Info("reconciled NetworkPolicy", "namespace", tenant.Name, "operation", npResult)
 
 	// --- RBAC: one RoleBinding per user ---
 	desired := make(map[string]bool) // tracks which RoleBinding names *should* exist
